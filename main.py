@@ -15,6 +15,7 @@ import time
 from typing import List, Union, Generator, Iterator
 from pydantic import BaseModel, Field
 from open_webui.utils.misc import pop_system_message
+from bs4 import BeautifulSoup
 
 
 class Pipe:
@@ -31,7 +32,13 @@ class Pipe:
         pass
 
     def get_sambanova_models(self):
-        # Updated list of SambaNova models with context lengths added to display names (02-01-2025) 
+        """Get models from SambaNova community page, falling back to hardcoded list if needed"""
+        # Try to get models from web first
+        scraped_models = self._scrape_sambanova_models()
+        if scraped_models:
+            return scraped_models
+            
+        # Fallback to hardcoded models if scraping fails
         return [
             # Qwen 2.5 family
             {"id": "Qwen2.5-Coder-32B-Instruct", "name": "Qwen2.5 Coder 32B (8k)"},
@@ -51,6 +58,49 @@ class Pipe:
             {"id": "Meta-Llama-Guard-3-8B", "name": "Llama Guard 3 8B (8k)"},
         ]
 
+    def _scrape_sambanova_models(self):
+        """Scrape models from SambaNova community page"""
+        try:
+            response = requests.get(
+                "https://community.sambanova.ai/t/supported-models/193",
+                timeout=10,
+                verify=False
+            )
+            soup = BeautifulSoup(response.text, "html.parser")
+            
+            models = []
+            for h3 in soup.find_all('h3'):
+                if 'family' not in h3.get_text().lower():
+                    continue
+                
+                family_name = h3.get_text().strip().replace(' family', '')
+                
+                if ol := h3.find_next('ol'):
+                    for li in ol.find_all('li', recursive=False):
+                        if code := li.find('code'):
+                            context_text = li.find(string=lambda t: t and 'Context length:' in t)
+                            if context_text:
+                                try:
+                                    ctx = context_text.split(':')[1].strip().split()[0]
+                                    context = int(ctx[:-1]) * 1000 if ctx.lower().endswith('k') else int(ctx)
+                                    model_id = code.get_text().strip()
+                                    
+                                    # Format name to include family, full model ID and context length
+                                    name = f"{family_name} {model_id} ({context//1000}k)"
+                                    
+                                    models.append({
+                                        "id": model_id,
+                                        "name": name
+                                    })
+                                except:
+                                    continue
+            
+            return models if models else []
+            
+        except Exception as e:
+            print(f"Error scraping SambaNova models: {e}")
+            return []
+
     def pipes(self) -> List[dict]:
         return self.get_sambanova_models()
 
@@ -64,12 +114,13 @@ class Pipe:
                 {"role": message["role"], "content": message.get("content", "")}
             )
 
-        # Remove the "samba_nova_api." prefix if present in the model ID
+        # Remove any known prefixes from the model ID
         model_id = body["model"]
-        if model_id.startswith("sambanova."):
-            model_id = model_id[len("sambanova.") :]
-        elif model_id.startswith("samba_nova_api."):
-            model_id = model_id[len("samba_nova_api.") :]
+        prefixes_to_strip = ["sambanova/", "sambanova.", "samba_nova_api.", "samba_test."]
+        for prefix in prefixes_to_strip:
+            if model_id.startswith(prefix):
+                model_id = model_id[len(prefix):]
+                break
 
         payload = {
             "model": model_id,
